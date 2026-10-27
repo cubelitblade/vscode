@@ -5,18 +5,22 @@
 
 import assert from 'assert';
 import { $ } from '../../../../../base/browser/dom.js';
+import { mainWindow } from '../../../../../base/browser/window.js';
 import { timeout } from '../../../../../base/common/async.js';
 import { Emitter } from '../../../../../base/common/event.js';
+import { DisposableStore, toDisposable } from '../../../../../base/common/lifecycle.js';
 import { constObservable, observableValue } from '../../../../../base/common/observable.js';
 import { mock } from '../../../../../base/test/common/mock.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { InMemoryStorageService } from '../../../../../platform/storage/common/storage.js';
 import { AbstractChatView } from '../../../../browser/parts/chatView.js';
 import { SessionView } from '../../../../browser/parts/sessionView.js';
-import { ISessionGridLayout, SessionGridCell, SessionLayoutMode } from '../../../../common/sessionGridLayout/sessionGridLayout.js';
+import { computeSessionGridLayout, ISessionGridLayout, SessionGridCell, SessionLayoutMode, SessionTerminalPosition } from '../../../../common/sessionGridLayout/sessionGridLayout.js';
 import { IChatWindowKind } from '../../../../services/chatWindow/browser/chatWindowService.js';
 import { ChatWindowCellView, ChatWindowGridHost, IChatWindowCellConstraints } from '../../browser/chatWindowGridHost.js';
+import { LayoutPriority } from '../../../../../base/browser/ui/splitview/splitview.js';
 import { ChatWindowInputOnlyController } from '../../browser/chatWindowInputOnly.js';
+import { getChatWindowDefaultSizing } from '../../browser/chatWindowService.js';
 import { ChatWindowDefaults, ChatWindowState } from '../../browser/chatWindowState.js';
 
 suite('Chat window input only', () => {
@@ -78,7 +82,8 @@ suite('Chat window input only', () => {
 		}();
 		const chatCell = disposables.add(new ChatWindowCellView(SessionGridCell.Chat, chatConstraints));
 		const controller = disposables.add(new ChatWindowInputOnlyController(sessionView, state, gridHost, chatCell, $('div'), layout, chatConstraints, EDITOR_MINIMUM_HEIGHT));
-		const read = () => ({ shown: chatView.inputOnly.get(), chosen: state.inputOnly.get(), maximumHeight: chatCell.maximumHeight });
+		// Kept at its input by giving way last as the window is resized (low priority), never by a fixed height.
+		const read = () => ({ shown: chatView.inputOnly.get(), chosen: state.inputOnly.get(), keptToInput: chatCell.priority === LayoutPriority.Low && chatCell.maximumHeight === chatConstraints.maximumHeight });
 		/** The window is resized: the chat and the editor area take these heights. */
 		const resize = async (chatHeight: number, editorHeight: number) => {
 			sizes.set(SessionGridCell.Chat, chatHeight);
@@ -109,9 +114,9 @@ suite('Chat window input only', () => {
 		chatView.needConversation();
 		await timeout(0);
 		assert.deepStrictEqual({ inputOnly, conversation: read(), resized }, {
-			inputOnly: { shown: true, chosen: true, maximumHeight: INPUT_HEIGHT },
+			inputOnly: { shown: true, chosen: true, keptToInput: true },
 			// Its least height, out of the editor area: the conversation shows, not squeezed to the input.
-			conversation: { shown: false, chosen: true, maximumHeight: chatConstraints.maximumHeight },
+			conversation: { shown: false, chosen: true, keptToInput: false },
 			resized: [INPUT_HEIGHT + 120],
 		});
 	});
@@ -124,9 +129,9 @@ suite('Chat window input only', () => {
 		const tooShort = read();
 		await resize(INPUT_HEIGHT, 500);
 		assert.deepStrictEqual({ conversation, tooShort, grown: read() }, {
-			conversation: { shown: false, chosen: false, maximumHeight: chatConstraints.maximumHeight },
-			tooShort: { shown: true, chosen: false, maximumHeight: INPUT_HEIGHT },
-			grown: { shown: false, chosen: false, maximumHeight: chatConstraints.maximumHeight },
+			conversation: { shown: false, chosen: false, keptToInput: false },
+			tooShort: { shown: true, chosen: false, keptToInput: true },
+			grown: { shown: false, chosen: false, keptToInput: false },
 		});
 	});
 
@@ -138,8 +143,8 @@ suite('Chat window input only', () => {
 		controller.toggleConversation();
 		await timeout(0);
 		assert.deepStrictEqual({ forced, toggled: read() }, {
-			forced: { shown: true, chosen: false, maximumHeight: INPUT_HEIGHT },
-			toggled: { shown: false, chosen: false, maximumHeight: chatConstraints.maximumHeight },
+			forced: { shown: true, chosen: false, keptToInput: true },
+			toggled: { shown: false, chosen: false, keptToInput: false },
 		});
 	});
 
@@ -153,7 +158,7 @@ suite('Chat window input only', () => {
 		await timeout(0);
 		controller.toggleConversation();
 		await resize(INPUT_HEIGHT, 500);
-		assert.deepStrictEqual(read(), { shown: true, chosen: true, maximumHeight: INPUT_HEIGHT });
+		assert.deepStrictEqual(read(), { shown: true, chosen: true, keptToInput: true });
 	});
 
 	test('what the window forced no longer holds once the chat shows its conversation: showing only the input from the chat later is the user\'s choice, and stays', async () => {
@@ -167,6 +172,64 @@ suite('Chat window input only', () => {
 		// From the chat itself, as its own control does.
 		chatView.setInputOnly(true);
 		await resize(INPUT_HEIGHT, 500);
-		assert.deepStrictEqual(read(), { shown: true, chosen: true, maximumHeight: INPUT_HEIGHT });
+		assert.deepStrictEqual(read(), { shown: true, chosen: true, keptToInput: true });
 	});
+
+	for (const terminals of [false, true]) {
+		test(`in Stacked, the sash above a chat that shows only its input can be dragged, and dragging it up shows the conversation; a window resize keeps the input alone at its height (terminals: ${terminals})`, async () => {
+			const store = disposables.add(new DisposableStore());
+			const container = mainWindow.document.body.appendChild($('.chat-window-host'));
+			container.style.cssText = 'position: absolute; top: 0; left: 0; width: 800px; height: 700px;';
+			store.add(toDisposable(() => container.remove()));
+			const cells = new Map<SessionGridCell, ChatWindowCellView>();
+			for (const cell of [SessionGridCell.Chat, SessionGridCell.SidePane, SessionGridCell.Terminals, SessionGridCell.Column]) {
+				const view = store.add(new ChatWindowCellView(cell, cell === SessionGridCell.Chat ? chatConstraints : { minimumWidth: cell === SessionGridCell.Column ? 34 : 100, maximumWidth: cell === SessionGridCell.Column ? 34 : Number.POSITIVE_INFINITY, minimumHeight: 80, maximumHeight: Number.POSITIVE_INFINITY }));
+				view.setContent({ element: $('div'), layout: () => { } });
+				cells.set(cell, view);
+			}
+			const gridHost = store.add(new ChatWindowGridHost(container, cells, (cell, axis) => cell === SessionGridCell.Column && axis === 'row' ? { kind: 'fixed', size: 34 } : getChatWindowDefaultSizing(cell, axis)));
+			gridHost.layoutGrid(800, 700);
+			const layout = observableValue<ISessionGridLayout>('layout', computeSessionGridLayout({ mode: SessionLayoutMode.Stacked, terminalPosition: SessionTerminalPosition.FullWidth, terminalsVisible: terminals, activityBar: false, inputOnly: true }));
+			gridHost.apply(layout.get());
+			const state = new ChatWindowState(kind, true, new ChatWindowDefaults(kind, store.add(new InMemoryStorageService())));
+			state.setInputOnly(true);
+			const chatView = new TestChatView();
+			const sessionView = new class extends mock<SessionView>() {
+				override readonly primaryChatView = constObservable(chatView as unknown as AbstractChatView);
+				override readonly primaryChatViewTop = constObservable(0);
+			}();
+			store.add(new ChatWindowInputOnlyController(sessionView, state, gridHost, cells.get(SessionGridCell.Chat)!, container, layout, chatConstraints, EDITOR_MINIMUM_HEIGHT));
+			await timeout(0);
+			const chatHeight = () => gridHost.getSize(SessionGridCell.Chat)?.height;
+			const inputOnly = { shown: chatView.inputOnly.get(), height: chatHeight() };
+
+			// The window is resized: the editor area takes the change, the chat keeps its input's height.
+			gridHost.layoutGrid(800, 600);
+			await timeout(0);
+			const resized = { shown: chatView.inputOnly.get(), height: chatHeight() };
+
+			// The sash right above the chat, dragged up by 250px as the user does.
+			const chatTop = cells.get(SessionGridCell.Chat)!.element.getBoundingClientRect().top;
+			const sash = Array.from(container.querySelectorAll<HTMLElement>('.monaco-sash.horizontal')).sort((a, b) => Math.abs(a.getBoundingClientRect().top - chatTop) - Math.abs(b.getBoundingClientRect().top - chatTop))[0];
+			const enabled = !sash.classList.contains('disabled');
+			const bounds = sash.getBoundingClientRect();
+			const x = bounds.left + bounds.width / 2;
+			const y = bounds.top + bounds.height / 2;
+			sash.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, clientX: x, clientY: y }));
+			sash.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: x, clientY: y, button: 0 }));
+			mainWindow.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: x, clientY: y - 250 }));
+			mainWindow.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: x, clientY: y - 250 }));
+			mainWindow.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, clientX: x, clientY: y - 250 }));
+			await timeout(0);
+			const dragged = { shown: chatView.inputOnly.get(), taller: (chatHeight() ?? 0) > INPUT_HEIGHT + 200 };
+
+			assert.deepStrictEqual({ inputOnly, resized, enabled, dragged }, {
+				inputOnly: { shown: true, height: INPUT_HEIGHT },
+				resized: { shown: true, height: INPUT_HEIGHT },
+				enabled: true,
+				dragged: { shown: false, taller: true },
+			});
+			store.dispose();
+		});
+	}
 });
