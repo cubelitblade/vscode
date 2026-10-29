@@ -54,7 +54,7 @@ import { AICustomizationListWidget } from './aiCustomizationListWidget.js';
 import { IAICustomizationListItem } from './aiCustomizationItemSource.js';
 import { IAICustomizationItemsModel, ITEMS_MODEL_SECTIONS } from './aiCustomizationItemsModel.js';
 import { renderCustomizationMarketplaceIcon } from './aiCustomizationPresentation.js';
-import { McpListWidget } from './mcpListWidget.js';
+import { createInstalledPluginItem, McpListWidget } from './mcpListWidget.js';
 import { PluginListWidget } from './pluginListWidget.js';
 import { ToolsListWidget } from './toolsListWidget.js';
 import { AGENT_HOST_COPILOT_CLI_SESSION_TYPE } from '../agentSessions/agentHost/agentHostToolSetEnablementService.js';
@@ -1203,6 +1203,9 @@ export class AICustomizationManagementEditor extends EditorPane {
 		}));
 		this.editorDisposables.add(this.listWidget.onDidRequestBrowse(() => {
 			this.selectSection(AICustomizationManagementSection.Skills, { showMarketplace: true });
+		}));
+		this.editorDisposables.add(this.listWidget.onDidRequestShowPlugin(plugin => {
+			this.showPluginDetail(createInstalledPluginItem(plugin));
 		}));
 
 		// Container for Models content (only in sessions)
